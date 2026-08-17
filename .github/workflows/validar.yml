@@ -1,0 +1,142 @@
+name: Validar entrega
+
+# Roda em todo Pull Request e comenta o resultado.
+# O aluno pode corrigir e dar push no mesmo branch — o workflow roda de novo.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar Graphviz
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq graphviz
+
+      - name: Descobrir quais pastas de exercício mudaram
+        id: alvo
+        run: |
+          BASE="origin/${{ github.event.pull_request.base.ref }}"
+          PASTAS=$(git diff --name-only "$BASE"...HEAD \
+                    | grep -oE '^(exercicios/aula[0-9]{2}|projeto)' \
+                    | sort -u | tr '\n' ' ')
+          echo "pastas=$PASTAS" >> "$GITHUB_OUTPUT"
+          if [ -z "$PASTAS" ]; then
+            echo "vazio=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "vazio=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Pastas alteradas: ${PASTAS:-nenhuma}"
+
+      - name: Verificar título do PR
+        id: titulo
+        env:
+          TITULO: ${{ github.event.pull_request.title }}
+        run: |
+          if echo "$TITULO" | grep -qE '^\[(Aula [0-9]{2}|Bloco [234]|MiniLang M[1-6])\] .+'; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verificar presença de respostas.md
+        id: respostas
+        if: steps.alvo.outputs.vazio == 'false'
+        run: |
+          FALTANDO=""
+          for P in ${{ steps.alvo.outputs.pastas }}; do
+            case "$P" in
+              exercicios/aula*)
+                [ -f "$P/respostas.md" ] || FALTANDO="$FALTANDO $P" ;;
+            esac
+          done
+          echo "faltando=$FALTANDO" >> "$GITHUB_OUTPUT"
+          [ -z "$FALTANDO" ] && echo "ok=true" >> "$GITHUB_OUTPUT" || echo "ok=false" >> "$GITHUB_OUTPUT"
+
+      - name: Rodar pytest
+        id: testes
+        if: steps.alvo.outputs.vazio == 'false'
+        continue-on-error: true
+        run: |
+          uv add pytest pytest-cov graphviz automata-lib ply lark --quiet || true
+          set -o pipefail
+          uv run pytest ${{ steps.alvo.outputs.pastas }} -v --tb=short 2>&1 \
+            | tee /tmp/pytest.txt
+        # continue-on-error para que o comentário seja postado mesmo com falha
+
+      - name: Montar e postar comentário
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          VAZIO: ${{ steps.alvo.outputs.vazio }}
+          PASTAS: ${{ steps.alvo.outputs.pastas }}
+          TITULO_OK: ${{ steps.titulo.outputs.ok }}
+          RESP_OK: ${{ steps.respostas.outputs.ok }}
+          RESP_FALTANDO: ${{ steps.respostas.outputs.faltando }}
+          TESTES: ${{ steps.testes.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const {VAZIO, PASTAS, TITULO_OK, RESP_OK, RESP_FALTANDO, TESTES} = process.env;
+
+            let saida = '';
+            try {
+              saida = fs.readFileSync('/tmp/pytest.txt', 'utf8').slice(-6000);
+            } catch { saida = '(pytest não executou)'; }
+
+            const linhas = [];
+            linhas.push('## 🤖 Validação automática');
+            linhas.push('');
+
+            if (VAZIO === 'true') {
+              linhas.push('⚠️ **Nenhuma pasta de exercício foi alterada neste PR.**');
+              linhas.push('');
+              linhas.push('Verifique se você editou os arquivos dentro de `exercicios/aulaNN/`.');
+            } else {
+              linhas.push(`**Pastas avaliadas:** \`${PASTAS.trim()}\``);
+              linhas.push('');
+              linhas.push('| Verificação | Resultado |');
+              linhas.push('|---|---|');
+              linhas.push(`| Título do PR no padrão | ${TITULO_OK === 'true' ? '✅ ok' : '⚠️ fora do padrão `[Aula NN] Seu Nome`'} |`);
+              linhas.push(`| \`respostas.md\` presente | ${RESP_OK === 'true' ? '✅ ok' : '❌ faltando em `' + (RESP_FALTANDO || '').trim() + '`'} |`);
+              linhas.push(`| \`pytest\` | ${TESTES === 'success' ? '✅ passou' : '❌ falhou'} |`);
+              linhas.push('');
+              linhas.push('<details><summary>Saída do pytest</summary>');
+              linhas.push('');
+              linhas.push('```');
+              linhas.push(saida);
+              linhas.push('```');
+              linhas.push('');
+              linhas.push('</details>');
+              linhas.push('');
+              if (TESTES !== 'success') {
+                linhas.push('> Corrija e dê **push no mesmo branch** — a validação roda novamente.');
+              } else {
+                linhas.push('> Tudo verde. A correção manual (rubrica) vem em seguida.');
+              }
+            }
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: linhas.join('\n'),
+            });
+
+      - name: Falhar o job se os testes falharam
+        if: steps.alvo.outputs.vazio == 'false' && steps.testes.outcome != 'success'
+        run: exit 1
