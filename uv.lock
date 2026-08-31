@@ -173,7 +173,7 @@ wheels = [
 [[package]]
 name = "teoria-computacao-compiladores-2026-exercicios"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "automata-lib" },
     { name = "graphviz" },
